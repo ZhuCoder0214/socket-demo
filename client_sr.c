@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 //#define USE_GBN
 #define USE_SR
 #define SERVER_IP "192.168.56.103"
@@ -14,6 +16,67 @@
 #define TIMEOUT_SEC 2
 #define WINDOW_SIZE 3
 #define MAX_SEQ 20
+#define QUEUE_SIZE 1024
+#define THREAD_NUM 4
+typedef struct{
+    char data[BUFFER_SIZE];
+    struct sockaddr_in server_addr;
+}SendTask;
+typedef struct{
+    SendTask buf[QUEUE_SIZE];
+    atomic_uint head;
+    atomic_uint tail;
+}LockFreeQueue;
+LockFreeQueue send_queue;
+int sockfd;
+volatile int running=1;
+void queue_init(LockFreeQueue *q){
+    atomic_init(&q->head,0);
+    atomic_init(&q->tail,0);
+}
+int queue_enqueue(LockFreeQueue *q,const SendTask *task){
+    uint32_t tail=atomic_load(&q->tail);
+    uint32_t head=atomic_load(&q->head);
+    uint32_t next_tail=(tail+1)%QUEUE_SIZE;
+    //printf("[DEBUG] head=%u,tail=%u\n",head,tail);
+    //printf("[DEBUG] next_tail=%u\n",next_tail);
+    if(next_tail==atomic_load(&q->head)){
+      //  printf("[DEBUG] full");
+        return -1;
+    }
+    q->buf[tail]=*task;
+    atomic_store(&q->tail,next_tail);
+    //printf("[DEBUG] enter success,new tail=%u\n",next_tail);
+    return 0;
+}
+int queue_dequeue(LockFreeQueue *q,SendTask *task){
+    uint32_t head=atomic_load(&q->head);
+    if(head==atomic_load(&q->tail)){
+        return -1;
+    }
+    *task=q->buf[head];
+    atomic_store(&q->head,(head+1)%QUEUE_SIZE);
+    return 0;
+}
+void *consumer_thread(void *arg){
+    (void)arg;
+    SendTask task;
+    printf("success!\n");
+    while(running){
+        if(queue_dequeue(&send_queue,&task)==0){
+            printf("[THREAD %lu] pack:%s\n",pthread_self(),task.data);
+            int ret=sendto(sockfd,task.data,strlen(task.data),0,(struct sockaddr *)&task.server_addr,sizeof(task.server_addr));
+            if(ret<0){
+                perror("sendto failed");
+            }else{
+                printf("[THREAD %lu] send success!bytes:%d\n",pthread_self(),ret);
+            }
+        }else{
+            usleep(1000);
+        }
+    }
+    return NULL;
+}
 typedef struct{
     int seq;
     int acked;
@@ -23,9 +86,11 @@ typedef struct{
 Packet send_window[WINDOW_SIZE];
 int base=0;
 int next_seq=0;
+
 int main(){
+    
     char send_buf[BUFFER_SIZE];
-    int sockfd;
+   
     struct sockaddr_in server_addr;
     char buffer[BUFFER_SIZE];
     char user_input[BUFFER_SIZE];
@@ -38,6 +103,12 @@ int main(){
     memset(&server_addr,0,sizeof(server_addr));
     server_addr.sin_family=AF_INET;
     server_addr.sin_port=htons(SERVER_PORT);
+  
+    queue_init(&send_queue);
+    pthread_t threads[THREAD_NUM];
+    for(int i=0;i<THREAD_NUM;i++){
+        pthread_create(&threads[i],NULL,consumer_thread,NULL);
+    }
     if(inet_pton(AF_INET,SERVER_IP,&server_addr.sin_addr)<=0){
         perror("inet_pton failed,please check ip");
         close(sockfd);
@@ -71,12 +142,14 @@ int main(){
             send_window[idx].send_time=time(NULL);
             snprintf(send_window[idx].data,BUFFER_SIZE,"%d:%.*s",next_seq,(int)(BUFFER_SIZE-10),user_input);
             int len=strlen(send_window[idx].data);
-            int ret=sendto(sockfd,send_window[idx].data,len,0,(struct sockaddr*)&server_addr,sizeof(server_addr));
-            if(ret>0){
-                printf("[CLIENT] send seq=%d,len=%d bytes\n",next_seq,ret);
-            }else{
-                perror("sendto failed");
+            SendTask task;
+            strcpy(task.data,send_window[idx].data);
+            task.server_addr=server_addr;
+            while(queue_enqueue(&send_queue,&task)!=0){
+                usleep(1000);
             }
+            printf("[CLIENT] send seq=%d,len=%d\n",next_seq,len);
+           
             next_seq++;
         }
         struct sockaddr_in from_addr;
@@ -89,7 +162,14 @@ int main(){
                 for(int i=base;i<next_seq;i++){
                     int idx=i%WINDOW_SIZE;
                     if(!send_window[idx].acked){
-                        printf("[CLIENT] resend seq=%d\n",send_window[idx].seq); sendto(sockfd,send_window[idx].data,strlen(send_window[idx].data),0,(struct sockaddr*)&server_addr,sizeof(server_addr));
+                        printf("[CLIENT] resend seq=%d\n",send_window[idx].seq); 
+                        SendTask task;
+                        strcpy(task.data,send_window[idx].data);
+                        task.server_addr=server_addr;
+                        while(queue_enqueue(&send_queue,&task)!=0){
+                            usleep(1000);
+                        }
+            
                         send_window[idx].send_time=time(NULL);
                      }
                 }
@@ -98,9 +178,14 @@ int main(){
                 time_t now=time(NULL);
                 for(int i=base;i<next_seq;i++){
                     int idx=i%WINDOW_SIZE;
-                    if(!send_window[idx].acked && (now-send_window[idx].send_time)>=TIMEOUT_SEC){
+                    if(!send_window[idx].acked && (now - send_window[idx].send_time)>=TIMEOUT_SEC){
                         printf("[CLIENT] SR seq=%d\n",send_window[idx].seq);
-                        sendto(sockfd,send_window[idx].data,strlen(send_window[idx].data),0,(struct sockaddr*)&server_addr,sizeof(server_addr));
+                        SendTask task;
+                        strcpy(task.data,send_window[idx].data);
+                        task.server_addr=server_addr;
+                        while(queue_enqueue(&send_queue,&task)!=0){
+                        usleep(1000);
+                    }
                         send_window[idx].send_time=time(NULL);
                         }
                     }
@@ -121,7 +206,13 @@ int main(){
                     if(dup_ack_count==3){
                         printf("[CLIENT] duplicate ACK,fast retransmit seq:%d\n",ack_seq+1);
                         int idx=
-                        (ack_seq+1)%WINDOW_SIZE;                           sendto(sockfd,send_window[idx].data,strlen(send_window[idx].data),0,(struct sockaddr*)&server_addr,sizeof(server_addr));
+                        (ack_seq+1)%WINDOW_SIZE;                          
+                        SendTask task;
+                        strcpy(task.data,send_window[idx].data);
+                        task.server_addr=server_addr;
+                        while(queue_enqueue(&send_queue,&task)!=0){
+                            usleep(1000);
+                        }
                         send_window[idx].send_time=time(NULL);
                         }
                     }else{
@@ -140,7 +231,12 @@ int main(){
                         if(dup_ack_count==3){
                             printf("[CLIENT] dup ACK,SR seq:%d\n",ack_seq);
                             int idx=ack_seq%WINDOW_SIZE;
-                            sendto(sockfd,send_window[idx].data,strlen(send_window[idx].data),0,(struct sockaddr*)&server_addr,sizeof(server_addr));
+                            SendTask task;
+                            strcpy(task.data,send_window[idx].data);
+                            task.server_addr=server_addr;
+                            while(queue_enqueue(&send_queue,&task)!=0){
+                                usleep(1000);
+                            }
                             send_window[idx].send_time=time(NULL);
                             }
                         }else{
@@ -155,8 +251,13 @@ int main(){
 #endif
                 }
             }
+            sleep(1);
+            running=0;
+            for(int i=0;i<THREAD_NUM;i++){
+                pthread_join(threads[i],NULL);
             }
     close(sockfd);
     printf("[CLIENT] exit\n");
     return 0;
+}
 }
