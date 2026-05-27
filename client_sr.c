@@ -1,3 +1,4 @@
+//多线程发包+无锁队列的CBN/SR 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,42 +23,47 @@ typedef struct{
     char data[BUFFER_SIZE];
     struct sockaddr_in server_addr;
 }SendTask;
+//无锁队列：实现消费者生产者模式 
 typedef struct{
-    SendTask buf[QUEUE_SIZE];
-    atomic_uint head;
-    atomic_uint tail;
+    SendTask buf[QUEUE_SIZE];//队列缓冲区 
+    atomic_uint head;//队头索引（消费者取数据） 
+    atomic_uint tail;//队尾索引（生产者放数据） 
 }LockFreeQueue;
 LockFreeQueue send_queue;
-int sockfd;
-volatile int running=1;
+int sockfd;//全局UDP套接字 
+volatile int running=1;//控制多线程运行
+//无锁队列初始化 
 void queue_init(LockFreeQueue *q){
     atomic_init(&q->head,0);
     atomic_init(&q->tail,0);
 }
+//入队（生产者） 
 int queue_enqueue(LockFreeQueue *q,const SendTask *task){
     uint32_t tail=atomic_load(&q->tail);
     uint32_t head=atomic_load(&q->head);
     uint32_t next_tail=(tail+1)%QUEUE_SIZE;
     //printf("[DEBUG] head=%u,tail=%u\n",head,tail);
     //printf("[DEBUG] next_tail=%u\n",next_tail);
-    if(next_tail==atomic_load(&q->head)){
+    if(next_tail==atomic_load(&q->head)){//入队失败 
       //  printf("[DEBUG] full");
         return -1;
     }
     q->buf[tail]=*task;
-    atomic_store(&q->tail,next_tail);
+    atomic_store(&q->tail,next_tail);//更新队尾索引 
     //printf("[DEBUG] enter success,new tail=%u\n",next_tail);
     return 0;
 }
+//出队（消费者） 
 int queue_dequeue(LockFreeQueue *q,SendTask *task){
     uint32_t head=atomic_load(&q->head);
-    if(head==atomic_load(&q->tail)){
+    if(head==atomic_load(&q->tail)){//出队失败 
         return -1;
     }
     *task=q->buf[head];
-    atomic_store(&q->head,(head+1)%QUEUE_SIZE);
+    atomic_store(&q->head,(head+1)%QUEUE_SIZE);//更新队头索引 
     return 0;
 }
+//消费者线程，实现多线程发包 
 void *consumer_thread(void *arg){
     (void)arg;
     SendTask task;
@@ -86,7 +92,7 @@ typedef struct{
 Packet send_window[WINDOW_SIZE];
 int base=0;
 int next_seq=0;
-
+//生产者主线程：把任务放进队列 
 int main(){
     
     char send_buf[BUFFER_SIZE];
@@ -106,6 +112,7 @@ int main(){
   
     queue_init(&send_queue);
     pthread_t threads[THREAD_NUM];
+    //创建THREAD_NUM个消费者线程（4个） 
     for(int i=0;i<THREAD_NUM;i++){
         pthread_create(&threads[i],NULL,consumer_thread,NULL);
     }
@@ -135,6 +142,7 @@ int main(){
             printf("[CLIENT]close...\n");
             break;
         }
+        //发送新包：生产者入队 
         while(next_seq<base+WINDOW_SIZE&&next_seq<MAX_SEQ){
             int idx=next_seq%WINDOW_SIZE;
             send_window[idx].seq=next_seq;
@@ -145,7 +153,7 @@ int main(){
             SendTask task;
             strcpy(task.data,send_window[idx].data);
             task.server_addr=server_addr;
-            while(queue_enqueue(&send_queue,&task)!=0){
+            while(queue_enqueue(&send_queue,&task)!=0){//入队，直到队满 
                 usleep(1000);
             }
             printf("[CLIENT] send seq=%d,len=%d\n",next_seq,len);
@@ -158,12 +166,13 @@ int main(){
         if(n<0){
             if(errno==EWOULDBLOCK||errno==EAGAIN){
                 printf("[CLIENT] overtime\n");
+//GBN和SR的超时重传和选择重传，用入队方式，而不是直接发送 
 #ifdef USE_GBN
                 for(int i=base;i<next_seq;i++){
                     int idx=i%WINDOW_SIZE;
                     if(!send_window[idx].acked){
                         printf("[CLIENT] resend seq=%d\n",send_window[idx].seq); 
-                        SendTask task;
+                        SendTask task;//构造重传任务 
                         strcpy(task.data,send_window[idx].data);
                         task.server_addr=server_addr;
                         while(queue_enqueue(&send_queue,&task)!=0){
@@ -180,7 +189,7 @@ int main(){
                     int idx=i%WINDOW_SIZE;
                     if(!send_window[idx].acked && (now - send_window[idx].send_time)>=TIMEOUT_SEC){
                         printf("[CLIENT] SR seq=%d\n",send_window[idx].seq);
-                        SendTask task;
+                        SendTask task;//构造重传任务 
                         strcpy(task.data,send_window[idx].data);
                         task.server_addr=server_addr;
                         while(queue_enqueue(&send_queue,&task)!=0){
@@ -251,10 +260,11 @@ int main(){
 #endif
                 }
             }
+            //主循环结束工作 
             sleep(1);
             running=0;
             for(int i=0;i<THREAD_NUM;i++){
-                pthread_join(threads[i],NULL);
+                pthread_join(threads[i],NULL);//等待所有线程结束 
             }
     close(sockfd);
     printf("[CLIENT] exit\n");
